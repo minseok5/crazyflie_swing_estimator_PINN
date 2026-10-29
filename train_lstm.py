@@ -33,7 +33,7 @@ PATIENCE = 15
 
 INPUT_SIZE = 6
 HIDDEN_SIZE = 256
-OUTPUT_SIZE = 2
+OUTPUT_SIZE = 4
 
 
 # ============================================================
@@ -242,6 +242,8 @@ for epoch in range(1, MAX_EPOCHS + 1):
                 "labels": [
                     "swing_angle_x_rad",
                     "swing_angle_y_rad",
+                    "swing_rate_x_radps",
+                    "swing_rate_y_radps",
                 ],
             },
             checkpoint_path,
@@ -320,10 +322,17 @@ print("TEST RESULTS")
 print("=" * 60)
 print(f"Best epoch: {best_epoch}")
 print(f"Best validation MSE: {best_val_loss:.8f}")
+
 print(f"X-axis angle MAE:  {mae[0]:.6f} rad ({np.degrees(mae[0]):.3f} deg)")
 print(f"Y-axis angle MAE:  {mae[1]:.6f} rad ({np.degrees(mae[1]):.3f} deg)")
 print(f"X-axis angle RMSE: {rmse[0]:.6f} rad ({np.degrees(rmse[0]):.3f} deg)")
 print(f"Y-axis angle RMSE: {rmse[1]:.6f} rad ({np.degrees(rmse[1]):.3f} deg)")
+
+print(f"X-axis angular velocity MAE: {mae[2]:.6f} rad/s")
+print(f"Y-axis angular velocity MAE: {mae[3]:.6f} rsd/s")
+print(f"X-axis angular velocity RMSE: {rmse[2]:.6f} rad/s")
+print(f"Y-axis angular velocity RMSE: {rmse[3]:.6f} rad/s")
+
 print(f"Overall MAE:  {overall_mae:.6f} rad")
 print(f"Overall RMSE: {overall_rmse:.6f} rad")
 
@@ -357,11 +366,13 @@ with metrics_path.open("w", encoding="utf-8") as f:
 
 prediction_plot_path = PREDICTION_DIR / "test_predictions.png"
 
-fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+fig, axes = plt.subplots(2, 2, figsize=(30, 15), sharex=True)
 
-labels = ["Swing angle X", "Swing angle Y"]
+labels = ["Swing angle X", "Swing angle Y", "Swing angular velocity X", "Swing angular velocity Y",]
 
-for i, ax in enumerate(axes):
+units = ["Angle (rad)", "Angle (rad)", "Angular velocity (rad/s)", "Angular velocity (rad/s)",]
+
+for i, ax in enumerate(axes.flat):
     ax.plot(
         y_test[:, i],
         label="Ground truth",
@@ -374,12 +385,13 @@ for i, ax in enumerate(axes):
         alpha=0.85,
     )
 
-    ax.set_ylabel("Angle (rad)")
+    ax.set_ylabel(units[i])
     ax.set_title(labels[i])
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-axes[-1].set_xlabel("Test sample index")
+for ax in axes[1, :]:
+    ax.set_xlabel("Test sample index")
 
 plt.tight_layout()
 plt.savefig(prediction_plot_path, dpi=150)

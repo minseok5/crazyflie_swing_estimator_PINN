@@ -30,6 +30,8 @@ FEATURES = [
 LABELS = [
     "swing_angle_x_rad",
     "swing_angle_y_rad",
+    "swing_rate_x_radps",
+    "swing_rate_y_radps",
 ]
 
 TIME_COLUMN = "time_s"
@@ -47,77 +49,99 @@ def load_data():
             f"No CSV files found in {DATA_DIR.resolve()}"
         )
 
-    if len(files) > 1:
-        print(
-            f"WARNING: {len(files)} CSV files found. "
-            "This initial version uses the most recently "
-            "modified CSV only."
-        )
-        files = [
-            max(files, key=lambda p: p.stat().st_mtime)
-        ]
-
-    file = files[0]
-    df = pd.read_csv(file)
-
-    print(f"Input file: {file}")
-    print(f"Rows: {len(df)}")
-    print(f"Columns: {len(df.columns)}")
+    print(f"Found {len(files)} CSV files.")
 
     required = [TIME_COLUMN] + FEATURES + LABELS
-    missing = [col for col in required if col not in df.columns]
+    loaded_data = []
 
-    if missing:
-        raise ValueError(
-            f"Missing required columns: {missing}"
+    for file in files:
+        print(f"\nLoading: {file.name}")
+
+        df = pd.read_csv(file)
+
+        original_rows = len(df)
+
+        # Remove the initial hovering phase.
+        if "trajectory_started" not in df.columns:
+            raise ValueError(
+                f"{file.name}: 'trajectory_stated' column not found. "
+                "Please regenerate this CSV with the update simulation script."
+            )
+
+        df["trajectory_started"] = pd.to_numeric(
+            df["trajectory_started"], errors="raise"
         )
 
-    # Keep only the variables required for this experiment.
-    df = df[required].copy()
-
-    # Convert required columns to numeric values.
-    for col in required:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Reject invalid rows rather than silently removing them.
-    if df.isna().any().any():
-        bad_counts = df.isna().sum()
-        bad_counts = bad_counts[bad_counts > 0]
-
-        raise ValueError(
-            "Missing or non-numeric values detected:\n"
-            f"{bad_counts}"
+        start_indices = np.flatnonzero(
+            df["trajectory_started"].to_numpy() == 1
         )
 
-    values = df[required].to_numpy(dtype=np.float64)
+        if len(start_indices) == 0:
+            raise ValueError(
+                f"{file.name}: No trajectory-start marker found."
+            )
 
-    if not np.isfinite(values).all():
-        raise ValueError(
-            "NaN or infinite values detected."
-        )
+        start_idx = int(start_indices[0])
+        strat_time = float(df.iloc[start_idx]["time_s"])
 
-    # Time must increase strictly.
-    time = df[TIME_COLUMN].to_numpy(dtype=np.float64)
-    dt = np.diff(time)
+        df = df.iloc[start_idx:].copy()
+        df = df.drop(columns=["trajectory_started"])
+        df = df.reset_index(drop=True)
 
-    if np.any(dt <= 0):
-        raise ValueError(
-            "Timestamps must be strictly increasing."
-        )
+        removed_rows = original_rows - len(df)
 
-    print(f"Start time: {time[0]:.6f} s")
-    print(f"End time:   {time[-1]:.6f} s")
-    print(f"Median dt:  {np.median(dt):.6f} s")
-    print(f"Median sampling rate: "
-          f"{1.0 / np.median(dt):.2f} Hz")
+        print(f"Original rows:              {original_rows}")
+        print(f"Hovering rows removed:      {removed_rows}")
+        print(f"Rows after hover removal:   {len(df)}")
+        print(f"Trajectory start time:      {strat_time:.3f} s")
 
-    print("\nInput statistics:")
-    print(df[FEATURES].describe().loc[["mean", "std", "min", "max"]])
+        missing = [col for col in required if col not in df.columns]
+        if missing:
+            raise ValueError(
+                f"{file.name}: Missing required columns: {missing}"
+            )
 
-    print("\nSwing-angle statistics:")
-    print(df[LABELS].describe().loc[["mean", "std", "min", "max"]])
+        df = df[required].copy()
 
-    return file, df
+        for col in required:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        if df.isna().any().any():
+            bad_counts = df.isna().sum()
+            bad_counts = bad_counts[bad_counts > 0]
+            raise ValueError(
+                f"{file.name}: Missing or non-numeric values:\n"
+                f"{bad_counts}"
+            )
+
+        values = df[required].to_numpy(dtype=np.float64)
+
+        if not np.isfinite(values).all():
+            raise ValueError(
+                f"{file.name}: NaN or infinite values detected."
+            )
+
+        time = df[TIME_COLUMN].to_numpy(dtype=np.float64)
+
+        if np.any(np.diff(time) <= 0):
+            raise ValueError(
+                f"{file.name}: Timestamps must increase strictly."
+            )
+
+        if len(df) <= WINDOW_SIZE + 2:
+            print(f"Skipping {file.name}: not enough rows.")
+            continue
+
+        print(f"Rows: {len(df)}")
+        print(f"Duration: {time[-1] - time[0]:.2f} s")
+        print(f"Median dt: {np.median(np.diff(time)):.6f} s")
+
+        loaded_data.append((file, df))
+
+    if not loaded_data:
+        raise ValueError("No usable CSV files were found.")
+
+    return loaded_data
 
 
 # ============================================================
@@ -157,61 +181,95 @@ def make_windows(data, window_size):
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    source_file, df = load_data()
+    loaded_data = load_data()
 
-    n = len(df)
+    # Split every flight log independently.
+    # Windows will never cross flight or split boundaries.
+    train_segments = []
+    val_segments = []
+    test_segments = []
 
-    if n <= WINDOW_SIZE + 2:
-        raise ValueError(
-            "Not enough rows to create time windows."
+    for source_file, df in loaded_data:
+        n = len(df)
+
+        train_end = int(n * TRAIN_RATIO)
+        val_end = int(n * (TRAIN_RATIO + VAL_RATIO))
+
+        train_df = df.iloc[:train_end].copy()
+        val_df = df.iloc[train_end:val_end].copy()
+        test_df = df.iloc[val_end:].copy()
+
+        if min(len(train_df), len(val_df), len(test_df)) <= WINDOW_SIZE:
+            raise ValueError(
+                f"{source_file.name}: A split is too short. "
+                "Use longer logs or adjust the split ratios."
+            )
+
+        train_segments.append(train_df)
+        val_segments.append(val_df)
+        test_segments.append(test_df)
+
+        print(
+            f"{source_file.name}: "
+            f"train={len(train_df)}, "
+            f"val={len(val_df)}, "
+            f"test={len(test_df)}"
         )
 
-    # Split chronologically BEFORE creating windows.
-    train_end = int(n * TRAIN_RATIO)
-    val_end = int(n * (TRAIN_RATIO + VAL_RATIO))
-
-    train_df = df.iloc[:train_end].copy()
-    val_df = df.iloc[train_end:val_end].copy()
-    test_df = df.iloc[val_end:].copy()
-
-    print("\nRaw time-series split:")
-    print(f"Train rows: {len(train_df)}")
-    print(f"Val rows:   {len(val_df)}")
-    print(f"Test rows:  {len(test_df)}")
-
-    # Fit standardization parameters on training inputs only.
-    train_features = train_df[FEATURES].to_numpy(
-        dtype=np.float64
+    # Fit normalization parameters using training data only.
+    train_features = np.concatenate(
+        [
+            segment[FEATURES].to_numpy(dtype=np.float64)
+            for segment in train_segments
+        ],
+        axis=0,
     )
 
     feature_mean = train_features.mean(axis=0)
     feature_std = train_features.std(axis=0)
-
-    # Avoid division by zero for constant features.
     feature_std[feature_std < 1e-8] = 1.0
 
-    # Apply the same transformation to all splits.
-    for split_df in [train_df, val_df, test_df]:
-        split_df.loc[:, FEATURES] = (
-            split_df[FEATURES] - feature_mean
-        ) / feature_std
+    # Normalize each segment using training-set statistics.
+    def normalize_segments(segments):
+        normalized = []
 
-    # Create each split independently so windows do not cross
-    # train/validation/test boundaries.
-    X_train, y_train = make_windows(
-        train_df, WINDOW_SIZE
-    )
-    X_val, y_val = make_windows(
-        val_df, WINDOW_SIZE
-    )
-    X_test, y_test = make_windows(
-        test_df, WINDOW_SIZE
-    )
+        for segment in segments:
+            segment = segment.copy()
+            segment.loc[:, FEATURES] = (
+                segment[FEATURES] - feature_mean
+            ) / feature_std
+            normalized.append(segment)
 
-    if min(len(X_train), len(X_val), len(X_test)) == 0:
-        raise ValueError(
-            "At least one split has no usable windows."
+        return normalized
+
+    train_segments = normalize_segments(train_segments)
+    val_segments = normalize_segments(val_segments)
+    test_segments = normalize_segments(test_segments)
+
+    # Create windows independently for each segment.
+    # No window can cross a flight-log or split boundary.
+    def combine_windows(segments):
+        all_X = []
+        all_y = []
+
+        for segment in segments:
+            X_part, y_part = make_windows(segment, WINDOW_SIZE)
+
+            if len(X_part) > 0:
+                all_X.append(X_part)
+                all_y.append(y_part)
+
+        if not all_X:
+            raise ValueError("No usable windows were created.")
+
+        return (
+            np.concatenate(all_X, axis=0),
+            np.concatenate(all_y, axis=0),
         )
+
+    X_train, y_train = combine_windows(train_segments)
+    X_val, y_val = combine_windows(val_segments)
+    X_test, y_test = combine_windows(test_segments)
 
     output_file = OUTPUT_DIR / "swing_dataset.npz"
 
@@ -228,7 +286,8 @@ def main():
     )
 
     metadata = {
-        "source_file": str(source_file),
+        "source_files": [str(file) for file, _ in loaded_data],
+        "number_of_csv_files": len(loaded_data),
         "window_size": WINDOW_SIZE,
         "features": FEATURES,
         "labels": LABELS,
@@ -255,7 +314,8 @@ def main():
     )
 
     print("\nDataset creation completed.")
-    print(f"Dataset:  {output_file}")
+    print(f"CSV files used: {len(loaded_data)}")
+    print(f"Dataset: {output_file}")
     print(f"Metadata: {metadata_file}")
 
     print("\nWindowed dataset shapes:")
@@ -265,7 +325,6 @@ def main():
     print(f"y_val:   {y_val.shape}")
     print(f"X_test:  {X_test.shape}")
     print(f"y_test:  {y_test.shape}")
-
 
 if __name__ == "__main__":
     main()

@@ -62,9 +62,9 @@ def get_circular_target(elapsed_time):
         omega = 2.0 *np.pi /CIRCLE_PERIOD
         theta = omega * elapsed_time
 
-        x_des = CIRCLE_CENTER_X - CIRCLE_RADIUS * np.cos(5 * theta)
+        x_des = CIRCLE_CENTER_X - CIRCLE_RADIUS * np.cos(5 *theta)
         y_des = CIRCLE_CENTER_Y + CIRCLE_RADIUS * np.sin(theta)
-        z_des = 2.0 + CIRCLE_ALTITUDE # * np.sin(theta / 5)
+        z_des = 1.5 # np.sin(theta / 5)
 
         return np.array([x_des, y_des, z_des])
 
@@ -227,6 +227,7 @@ def main():
 
     csv_writer.writerow([
         "time_s",
+        "trajectory_started",
         "target_x_m", "target_y_m", "target_z_m",
         "drone_x_m", "drone_y_m", "drone_z_m",
         "drone_vx_mps", "drone_vy_mps", "drone_vz_mps",
@@ -320,6 +321,7 @@ def main():
 
                 csv_writer.writerow([
                     data.time,
+                    int(move_started),
                     *pos_des,
                     *data.qpos[qa:qa+3],
                     *data.qvel[va:va+3],
