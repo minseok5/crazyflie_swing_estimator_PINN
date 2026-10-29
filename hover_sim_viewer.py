@@ -17,7 +17,7 @@ from simulation_core.pid_controller import (
 MODEL_PATH = Path("models/crazyflie/cf21B_500.xml")
 SIM_DURATION = 10.0
 DT = 1.0 / PHYSICS_HZ
-INITIAL_POS = np.array([0.0, 0.0, 0.5])
+INITIAL_POS = np.array([0.0, 0.0, 0.0])
 POS_DES = np.array([0.0, 0.0, 0.5])
 YAW_DES = 0.0
 REALTIME_VIEW = True

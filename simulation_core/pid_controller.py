@@ -107,21 +107,21 @@ class CascadePID:
                 settings = config.controller.pid
 
         # Position -> velocity setpoint.
-        self.kp_pos = float(getattr(settings, "kp_position", 4.0))
-        self.v_max = float(getattr(settings, "velocity_limit", 1.5))
+        self.kp_pos = float(getattr(settings, "kp_position", 10.0))
+        self.v_max = float(getattr(settings, "velocity_limit", 1.2))
 
         # Velocity PI -> acceleration setpoint.  The derivative gain remains a
         # stored compatibility value; master did not evaluate a D term.
-        self.kp_vel = float(getattr(settings, "kp_velocity", 4.0))
-        self.ki_vel = float(getattr(settings, "ki_velocity", 1.0))
-        self.kd_vel = float(getattr(settings, "kd_velocity", 0.0))
+        self.kp_vel = float(getattr(settings, "kp_velocity", 10.0))
+        self.ki_vel = float(getattr(settings, "ki_velocity", 0.2))
+        self.kd_vel = float(getattr(settings, "kd_velocity", 3.0))
 
         # Attitude P -> rate setpoint.
         self.kp_att = float(getattr(settings, "kp_attitude", 12.0))
 
         # Rate PI -> torque.  As on master, kd_rate is stored but not applied.
         self.kp_rate = np.asarray(
-            getattr(settings, "kp_rate", (0.0008, 0.0008, 0.0006)), dtype=float
+            getattr(settings, "kp_rate", (0.015, 0.015, 0.0008)), dtype=float
         ).copy()
         self.ki_rate = np.asarray(
             getattr(settings, "ki_rate", (0.0, 0.0, 0.0)), dtype=float
