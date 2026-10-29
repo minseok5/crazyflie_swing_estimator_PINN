@@ -48,7 +48,7 @@ HOVER_DURATION = 5.0
 
 YAW_DES = 0.0
 REALTIME_VIEW = True
-PAYLOAD_MASS = 0.020
+PAYLOAD_MASS = 0.010
 
 # CSV logging
 LOG_DIR = Path("outputs/payload")
