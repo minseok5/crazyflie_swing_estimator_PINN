@@ -20,8 +20,23 @@ import numpy as np
 
 from simulation_core.pid_controller import (
     CascadePID, K_TAU, MOTOR_DIR, THRUST_MIN, THRUST_MAX,
-    PHYSICS_HZ, build_allocation_matrix,
+    build_allocation_matrix,
 )
+
+from simulation_core.motor_dynamics import (
+    Cf21bFirstOrderActuatorModel,
+    InstantaneousActuatorModel,
+)
+
+from config.actuator_config import (
+    ENABLE_MOTOR_DYNAMICS,
+    MOTOR_TIME_CONSTANT,
+    OMEGA_REFERENCE,
+    THRUST_POLYNOMIAL,
+    ENABLE_REACTION_TORQUE,
+    REACTION_TORQUE_MODEL,
+)
+
 from . import dataset_config as cfg
 
 
@@ -137,12 +152,39 @@ def run_episode(
     mujoco.mj_forward(model, data)
 
     vehicle = SimpleNamespace(
-        mass=0.04338 + cfg.PAYLOAD_MASS,
-        gravity=9.81,
-        inertia_diagonal=(2.3951e-5, 2.3951e-5, 3.2347e-5),
+    mass=cfg.DRONE_MASS + cfg.PAYLOAD_MASS,
+    gravity=cfg.GRAVITY,
+    inertia_diagonal=cfg.DRONE_INERTIA,
     )
+
     pid = CascadePID(dt=cfg.DT, vehicle=vehicle)
     _, allocation_pinv = build_allocation_matrix()
+
+    actuator_common = {
+        "motor_direction": MOTOR_DIR,
+        "thrust_min": THRUST_MIN,
+        "thrust_max": THRUST_MAX,
+        "legacy_ratio_m": K_TAU,
+    }
+
+    if ENABLE_MOTOR_DYNAMICS:
+        actuator = Cf21bFirstOrderActuatorModel(
+            dt=cfg.DT,
+            **actuator_common,
+            time_constant_s=MOTOR_TIME_CONSTANT,
+            steady_state_gain_rad_s=OMEGA_REFERENCE,
+            thrust_polynomial_coefficients=THRUST_POLYNOMIAL,
+            reaction_torque_model=REACTION_TORQUE_MODEL,
+        )
+        print("Actuator: First-order motor dynamics enabled")
+    else:
+        actuator = InstantaneousActuatorModel(**actuator_common)
+        print("Actuator: Instantaneous model enabled")
+
+    actuator.reset(airborne=False)
+
+    _, allocation_pinv = build_allocation_matrix()
+
     force_ids = np.array([
         object_id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"motor{i}_force")
         for i in range(4)
@@ -169,14 +211,15 @@ def run_episode(
     stable_start_time = None
     move_started = False
     move_start_time = None
-    last_log_time = -cfg.LOG_INTERVAL
+    # last_log_time = -cfg.LOG_INTERVAL
+    log_every_n_steps = round(cfg.LOG_INTERVAL / cfg.DT)
     status = "completed"
     n_steps = int(math.ceil(duration / cfg.DT))
 
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(CSV_COLUMNS)
-        for _ in range(n_steps):
+        for step in range(n_steps):
             pos = data.qpos[qa:qa + 3].copy()
             quat = data.qpos[qa + 3:qa + 7].copy()
             vel = data.qvel[va:va + 3].copy()
@@ -211,12 +254,27 @@ def run_episode(
                 pos_W=pos, quat_wxyz=quat, vel_W=vel, omega_B=omega,
                 pos_des=target, yaw_des=cfg.YAW_DES,
             )
-            thrust = np.clip(allocation_pinv @ wrench, THRUST_MIN, THRUST_MAX)
-            data.ctrl[force_ids] = thrust
-            data.ctrl[torque_ids] = MOTOR_DIR * K_TAU * thrust
+
+            thrust_cmd = np.clip(
+                allocation_pinv @ wrench,
+                THRUST_MIN,
+                THRUST_MAX,
+            )
+
+            actuator_output = actuator.apply(thrust_cmd)
+
+            thrust_actual = actuator_output.f_actual
+            torque_actual = actuator_output.q_actual
+
+            if not ENABLE_REACTION_TORQUE:
+                torque_actual = np.zeros(4)
+
+            data.ctrl[force_ids] = thrust_actual
+            data.ctrl[torque_ids] = torque_actual
+
             mujoco.mj_step(model, data)
 
-            if data.time - last_log_time >= cfg.LOG_INTERVAL:
+            if (step +1) % log_every_n_steps == 0:
                 # Read all states after mj_step at the same simulation step.
                 pos_log = data.qpos[qa:qa + 3].copy()
                 quat_log = data.qpos[qa + 3:qa + 7].copy()
@@ -240,10 +298,10 @@ def run_episode(
                     episode_id, float(data.time), int(move_started), *target,
                     *pos_log, *vel_log, *quat_log, *omega_log, *acc_log, *payload_pos,
                     swing_angle_x, swing_angle_y, swing_rate_x, swing_rate_y,
-                    *thrust, *wrench,
+                    *thrust_actual, *wrench,
                 ]
                 writer.writerow(row)
-                last_log_time = float(data.time)
+                # last_log_time = float(data.time)
 
             if pos[2] < -0.1:
                 status = "possible_crash"

@@ -11,19 +11,49 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from config.simulation_config import (
+    PHYSICS_HZ,
+    GRAVITY,
+)
 
-# Legacy public constants.  Keeping these aliases lets old scripts import the
-# same values while config-driven runs use their resolved VehicleConfig.
-MASS = 0.04338
-GRAV = 9.81
-ARM = 0.035355
-K_TAU = 0.00594
-MOTOR_DIR = np.array([1.0, -1.0, 1.0, -1.0])
-THRUST_MIN = 0.0
-THRUST_MAX = 0.20
-J_DIAG = np.array([2.3951e-5, 2.3951e-5, 3.2347e-5])
-PHYSICS_HZ = 500.0
-TAU_MAX_RP = ARM * (2.0 * (2.0 * THRUST_MAX) - MASS * GRAV)
+from config.vehicle_config import (
+    DRONE_MASS,
+    DRONE_INERTIA,
+    ARM_LENGTH,
+)
+
+from config.actuator_config import (
+    K_TAU,
+    MOTOR_DIRECTION,
+    THRUST_MIN,
+    THRUST_MAX,
+)
+
+# Backward-compatible aliases
+MASS = DRONE_MASS
+GRAV = GRAVITY
+ARM = ARM_LENGTH
+
+MOTOR_DIR = np.asarray(MOTOR_DIRECTION, dtype=float)
+
+J_DIAG = np.asarray(DRONE_INERTIA, dtype=float)
+
+TAU_MAX_RP = ARM * (
+    2.0 * (2.0 * THRUST_MAX) - MASS * GRAV
+)
+
+# # Legacy public constants.  Keeping these aliases lets old scripts import the
+# # same values while config-driven runs use their resolved VehicleConfig.
+# MASS = 0.04338
+# GRAV = 9.81
+# ARM = 0.035355
+# K_TAU = 0.00594
+# MOTOR_DIR = np.array([1.0, -1.0, 1.0, -1.0])
+# THRUST_MIN = 0.0
+# THRUST_MAX = 0.20
+# J_DIAG = np.array([2.3951e-5, 2.3951e-5, 3.2347e-5])
+# PHYSICS_HZ = 500.0
+# TAU_MAX_RP = ARM * (2.0 * (2.0 * THRUST_MAX) - MASS * GRAV)
 
 
 def quat_normalize_wxyz(q: Sequence[float]) -> np.ndarray:

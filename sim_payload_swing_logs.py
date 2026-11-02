@@ -17,19 +17,65 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from simulation_core.pid_controller import (
-    CascadePID, K_TAU, MOTOR_DIR, THRUST_MIN, THRUST_MAX,
-    PHYSICS_HZ, build_allocation_matrix,
+    CascadePID,
+    K_TAU,
+    MOTOR_DIR,
+    THRUST_MIN,
+    THRUST_MAX,
+    build_allocation_matrix,
 )
 
-MODEL_PATH = Path('models/crazyflie/cf21B_500_payload.xml')
-BASE_MODEL = Path('models/crazyflie/cf21B_500.xml')
-DT = 1.0 / PHYSICS_HZ
-SIM_DURATION = 60.0
-# Keep the viewer's requested start position. A z offset can be used if the
-# ground contact geometry interferes with startup.
-INITIAL_POS = np.array([0.0, 0.0, 0.0])
+from config.simulation_config import (
+    MODEL_PATH as SIM_MODEL_PATH,
+    BASE_MODEL_PATH,
+    DT,
+    SIM_DURATION,
+    GRAVITY,
+    LOG_INTERVAL,
+)
 
-HOVER_POS = np.array([0.0, 0.0, 1.5])
+from config.vehicle_config import (
+    DRONE_MASS,
+    DRONE_INERTIA,
+    PAYLOAD_MASS,
+    INITIAL_DRONE_POSITION,
+    HOVER_POSITION,
+)
+
+from simulation_core.motor_dynamics import (
+    Cf21bFirstOrderActuatorModel,
+    InstantaneousActuatorModel,
+)
+
+from config.actuator_config import (
+    ENABLE_MOTOR_DYNAMICS,
+    MOTOR_DIRECTION,
+    THRUST_MIN,
+    THRUST_MAX,
+    K_TAU,
+    MOTOR_TIME_CONSTANT,
+    OMEGA_REFERENCE,
+    THRUST_POLYNOMIAL,
+    ENABLE_REACTION_TORQUE,
+    REACTION_TORQUE_MODEL,
+)
+
+# Simulation configuration
+MODEL_PATH = SIM_MODEL_PATH
+BASE_MODEL = BASE_MODEL_PATH
+
+INITIAL_POS = np.array(INITIAL_DRONE_POSITION, dtype=float)
+HOVER_POS = np.array(HOVER_POSITION, dtype=float)
+
+# MODEL_PATH = Path('models/crazyflie/cf21B_500_payload.xml')
+# BASE_MODEL = Path('models/crazyflie/cf21B_500.xml')
+# DT = 1.0 / PHYSICS_HZ
+# SIM_DURATION = 60.0
+# # Keep the viewer's requested start position. A z offset can be used if the
+# # ground contact geometry interferes with startup.
+# INITIAL_POS = np.array([0.0, 0.0, 0.0])
+
+# HOVER_POS = np.array([0.0, 0.0, 1.5])
 # MOVE_POS = np.array([3.5, 2.5, 1.5])
 
 # Circular trajectory parameters
@@ -62,9 +108,9 @@ def get_circular_target(elapsed_time):
         omega = 2.0 *np.pi /CIRCLE_PERIOD
         theta = omega * elapsed_time
 
-        x_des = CIRCLE_CENTER_X - CIRCLE_RADIUS * np.cos(5 *theta)
-        y_des = CIRCLE_CENTER_Y + CIRCLE_RADIUS * np.sin(theta)
-        z_des = 1.5 # np.sin(theta / 5)
+        x_des = CIRCLE_CENTER_X - CIRCLE_RADIUS * np.cos(3 * theta)
+        y_des = CIRCLE_CENTER_Y + CIRCLE_RADIUS * np.sin(0.1 * theta)
+        z_des = 1.5 + np.sin(theta / 5)
 
         return np.array([x_des, y_des, z_des])
 
@@ -190,10 +236,41 @@ def main():
 
     # Controller feed-forward mass includes drone and payload. This is only a
     # first hover baseline; the payload swing is not actively damped here.
-    vehicle = SimpleNamespace(mass=0.04338 + PAYLOAD_MASS, gravity=9.81,
-                              inertia_diagonal=(2.3951e-5, 2.3951e-5, 3.2347e-5))
+    vehicle = SimpleNamespace(mass=DRONE_MASS + PAYLOAD_MASS, gravity=GRAVITY, inertia_diagonal=DRONE_INERTIA,)
     pid = CascadePID(dt=DT, vehicle=vehicle)
     _, allocation_pinv = build_allocation_matrix()
+
+    # ============================================================
+    # Motor actuator model
+    # ============================================================
+
+    actuator_common = {
+        "motor_direction": MOTOR_DIRECTION,
+        "thrust_min": THRUST_MIN,
+        "thrust_max": THRUST_MAX,
+        "legacy_ratio_m": K_TAU,
+    }
+
+    if ENABLE_MOTOR_DYNAMICS:
+        actuator = Cf21bFirstOrderActuatorModel(
+            dt=DT,
+            **actuator_common,
+            time_constant_s=MOTOR_TIME_CONSTANT,
+            steady_state_gain_rad_s=OMEGA_REFERENCE,
+            thrust_polynomial_coefficients=THRUST_POLYNOMIAL,
+            reaction_torque_model=REACTION_TORQUE_MODEL,
+        )
+        print("Actuator: First-order motor dynamics enabled")
+
+    else:
+        actuator = InstantaneousActuatorModel(
+            **actuator_common,
+        )
+        print("Actuator: Instantaneous model enabled")
+
+    # Start with motors stopped
+    actuator.reset(airborne=False)
+
     force_ids = np.array([object_id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, f'motor{i}_force') for i in range(4)])
     torque_ids = np.array([object_id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, f'motor{i}_torque') for i in range(4)])
     gyro_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, 'imu_gyro')
@@ -301,11 +378,36 @@ def main():
             else:
                 pos_des = HOVER_POS
 
-            wrench = pid(pos_W=pos, quat_wxyz=quat, vel_W=vel, omega_B=omega,
-                         pos_des=pos_des, yaw_des=YAW_DES)
-            thrust = np.clip(allocation_pinv @ wrench, THRUST_MIN, THRUST_MAX)
-            data.ctrl[force_ids] = thrust
-            data.ctrl[torque_ids] = MOTOR_DIR * K_TAU * thrust
+            wrench = pid(
+                pos_W=pos,
+                quat_wxyz=quat,
+                vel_W=vel,
+                omega_B=omega,
+                pos_des=pos_des,
+                yaw_des=YAW_DES,
+            )
+
+            # Control allocation: requested motor thrust
+            thrust_cmd = np.clip(
+                allocation_pinv @ wrench,
+                THRUST_MIN,
+                THRUST_MAX,
+            )
+
+            # Motor actuator dynamics
+            actuator_output = actuator.apply(thrust_cmd)
+
+            # Actual motor thrust and reaction torque
+            thrust_actual = actuator_output.f_actual
+            torque_actual = actuator_output.q_actual
+
+            if not ENABLE_REACTION_TORQUE:
+                torque_actual = np.zeros(4)
+
+            # Apply actual actuator outputs to MuJoCo
+            data.ctrl[force_ids] = thrust_actual
+            data.ctrl[torque_ids] = torque_actual
+
             mujoco.mj_step(model, data)
 
             # Record simulation data at LOG_INTERVAL
@@ -334,7 +436,7 @@ def main():
                     *payload_pos,
                     swing_angle_x, swing_angle_y,
                     swing_rate_x, swing_rate_y,
-                    *thrust,
+                    *thrust_actual,
                     *wrench
                 ])
 
