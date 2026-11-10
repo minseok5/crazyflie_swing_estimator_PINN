@@ -632,6 +632,59 @@ class Cf21bFirstOrderActuatorModel(_BaseActuatorModel):
         requested = self.thrust_from_omega(target_omega)
         return self._advance(requested, command_u)
 
+    def predict_motor_command(
+        self, motor_command: Sequence[float]
+    ) -> ActuatorOutput:
+        """
+        Predict the next motor output without changing the actual actuator state.
+        """
+
+        command_u = np.clip(
+            _as_motor_vector(motor_command, "motor_command"),
+            0.0,
+            1.0,
+        )
+
+        # Current motor state
+        omega_before = self.omega.copy()
+
+        # First-order motor dynamics
+        decay = self.decay
+
+        # Predict next rotor speed
+        omega_pred = (
+            decay * omega_before
+            + (1.0 - decay)
+            * self.steady_state_gain_rad_s
+            * command_u
+        )
+
+        # Predict rotor acceleration
+        omega_dot_pred = (omega_pred - omega_before) / self.dt
+
+        # Predict actual thrust
+        thrust_pred = self.thrust_from_omega(omega_pred)
+
+        # Predict reaction torque
+        torque_pred = self._reaction_torque(
+            thrust_pred,
+            omega_pred,
+            omega_dot_pred,
+        )
+
+        # Requested thrust corresponding to ESC command
+        target_omega = command_u * self.steady_state_gain_rad_s
+        thrust_cmd = self.thrust_from_omega(target_omega)
+
+        # Return predicted output without modifying actual actuator state
+        return self._make_output(
+            f_cmd=thrust_cmd,
+            f_actual=thrust_pred,
+            motor_command=command_u,
+            omega=omega_pred,
+            q_actual=torque_pred,
+        )
+
     def _advance(
         self, f_cmd: np.ndarray, motor_command: np.ndarray
     ) -> ActuatorOutput:

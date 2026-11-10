@@ -9,7 +9,7 @@ import pandas as pd
 # Configuration
 # ============================================================
 
-DATA_DIR = Path("outputs/payload")
+DATA_DIR = Path("dataset_generation/outputs/train")
 OUTPUT_DIR = Path("outputs/training/datasets")
 
 WINDOW_SIZE = 15
@@ -19,12 +19,30 @@ VAL_RATIO = 0.15
 TEST_RATIO = 0.15
 
 FEATURES = [
+    # IMU: Accelerometer
     "acc_x_mps2",
     "acc_y_mps2",
     "acc_z_mps2",
+
+    # IMU: Gyroscope
     "gyro_x_radps",
     "gyro_y_radps",
     "gyro_z_radps",
+
+    # Motor angular velocity
+    "motor0_omega_radps",
+    "motor1_omega_radps",
+    "motor2_omega_radps",
+    "motor3_omega_radps",
+
+    # Desired attitude
+    "desired_roll_rad",
+    "desired_pitch_rad",
+    "desired_yaw_rad",
+
+    # Desired Thrust
+    "collective_force_N",
+
 ]
 
 LABELS = [
@@ -42,7 +60,7 @@ TIME_COLUMN = "time_s"
 # ============================================================
 
 def load_data():
-    files = sorted(DATA_DIR.glob("*.csv"))
+    files = sorted(DATA_DIR.glob("episode_*.csv"))
 
     if not files:
         raise FileNotFoundError(

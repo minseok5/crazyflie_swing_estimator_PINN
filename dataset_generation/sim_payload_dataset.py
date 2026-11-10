@@ -35,6 +35,10 @@ from config.actuator_config import (
     THRUST_POLYNOMIAL,
     ENABLE_REACTION_TORQUE,
     REACTION_TORQUE_MODEL,
+    TORQUE_POLYNOMIAL,
+    TORQUE_POLYNOMIAL_SCALE,
+    ROTOR_INERTIA,
+    ENABLE_ROTOR_ACCELERATION_TORQUE,
 )
 
 from . import dataset_config as cfg
@@ -69,18 +73,18 @@ def get_target(trajectory: str, elapsed: float, speed_scale: float) -> np.ndarra
         omega = 2.0 * math.pi / cfg.CIRCLE_PERIOD * speed_scale
         theta = omega * elapsed
         # Preserve the original simulation's existing trajectory equation.
-        x = cfg.CIRCLE_CENTER_X - cfg.CIRCLE_RADIUS * math.cos(2.0 * theta)
+        x = cfg.CIRCLE_CENTER_X - cfg.CIRCLE_RADIUS * math.cos(theta)
         y = cfg.CIRCLE_CENTER_Y + cfg.CIRCLE_RADIUS * math.sin(theta)
     elif trajectory == "figure8":
         omega = 2.0 * math.pi / cfg.FIGURE8_PERIOD * speed_scale
         theta = omega * elapsed
-        x = cfg.CIRCLE_CENTER_X + cfg.FIGURE8_AMPLITUDE_X * math.sin(theta)
-        y = cfg.CIRCLE_CENTER_Y + cfg.FIGURE8_AMPLITUDE_Y * math.sin(theta) * math.cos(theta)
+        x = cfg.FIGURE8_AMPLITUDE_X * math.sin(theta)
+        y = cfg.FIGURE8_AMPLITUDE_Y * math.sin(theta) * math.cos(theta)
     elif trajectory == "straight":
         # Smooth out-and-back path, bounded to STRAIGHT_DISTANCE.
-        period = max(2.0 * cfg.STRAIGHT_DISTANCE / cfg.STRAIGHT_SPEED / speed_scale, 1e-6)
+        period = max(math.pi * cfg.STRAIGHT_DISTANCE / (cfg.STRAIGHT_SPEED * speed_scale), 1e-6)
         phase = 2.0 * math.pi * elapsed / period
-        x = cfg.CIRCLE_CENTER_X + 0.5 * cfg.STRAIGHT_DISTANCE * math.sin(phase)
+        x = 0.5 * cfg.STRAIGHT_DISTANCE * (1.0 - math.sin(phase))
         y = cfg.CIRCLE_CENTER_Y
     else:
         raise ValueError(f"Unsupported trajectory {trajectory!r}; choose {cfg.TRAJECTORIES}")
@@ -98,8 +102,35 @@ CSV_COLUMNS = [
     "payload_x_m", "payload_y_m", "payload_z_m",
     "swing_angle_x_rad", "swing_angle_y_rad",
     "swing_rate_x_radps", "swing_rate_y_radps",
+
+    # Actual motor thrust
     "motor0_thrust_N", "motor1_thrust_N", "motor2_thrust_N", "motor3_thrust_N",
+
+    # Desired attitude
+    "desired_roll_rad",
+    "desired_pitch_rad",
+    "desired_yaw_rad",
+    
+    # Desired wrench
     "torque_x_Nm", "torque_y_Nm", "torque_z_Nm", "collective_force_N",
+
+    # ESC commands
+    "motor0_esc", "motor1_esc", "motor2_esc", "motor3_esc",
+
+    # Actual motor angular velocity
+    "motor0_omega_radps", "motor1_omega_radps", "motor2_omega_radps", "motor3_omega_radps",
+
+    # Applied motor reaction torque
+    "motor0_torque_Nm", "motor1_torque_Nm", "motor2_torque_Nm", "motor3_torque_Nm",
+
+    # Actual total thrust
+    "actual_total_thrust_N",
+
+    # Thrust tackinv error
+    "thrust_tracking_error_N",
+
+    # Number of saturated motors
+    "motor_saturation_count",
 ]
 
 
@@ -175,6 +206,10 @@ def run_episode(
             steady_state_gain_rad_s=OMEGA_REFERENCE,
             thrust_polynomial_coefficients=THRUST_POLYNOMIAL,
             reaction_torque_model=REACTION_TORQUE_MODEL,
+            torque_polynomial_coefficients=TORQUE_POLYNOMIAL,
+            torque_polynomial_scale=TORQUE_POLYNOMIAL_SCALE,
+            rotor_inertia_kg_m2=ROTOR_INERTIA,
+            include_rotor_acceleration_torque=ENABLE_ROTOR_ACCELERATION_TORQUE,
         )
         print("Actuator: First-order motor dynamics enabled")
     else:
@@ -255,6 +290,11 @@ def run_episode(
                 pos_des=target, yaw_des=cfg.YAW_DES,
             )
 
+            # Desired attitude
+            desired_roll = pid.desired_roll
+            desired_pitch = pid.desired_pitch
+            desired_yaw = pid.desired_yaw
+
             thrust_cmd = np.clip(
                 allocation_pinv @ wrench,
                 THRUST_MIN,
@@ -268,6 +308,11 @@ def run_episode(
 
             if not ENABLE_REACTION_TORQUE:
                 torque_actual = np.zeros(4)
+
+            actuator_output = actuator.apply(thrust_cmd)
+
+            # ESC command (normalize 0~1)
+            motor_command = actuator_output.motor_command
 
             data.ctrl[force_ids] = thrust_actual
             data.ctrl[torque_ids] = torque_actual
@@ -294,11 +339,56 @@ def run_episode(
                 swing_rate_x = float(data.qvel[swing_x_vadr])
                 swing_rate_y = float(data.qvel[swing_y_vadr])
 
+                # Actual total thrust
+                actual_total_thrust = float(np.sum(thrust_actual))
+
+                # Desired collective force from PID
+                desired_collective_force = float(wrench[3])
+
+                # Thrust tracking error
+                thrust_tracking_error = (actual_total_thrust - desired_collective_force)
+
+                # Count saturated motors
+                motor_saturation_count = int(np.sum((thrust_cmd <= THRUST_MIN + 1e-6) | (thrust_cmd >= THRUST_MAX - 1e+6)))
+
+
                 row = [
                     episode_id, float(data.time), int(move_started), *target,
-                    *pos_log, *vel_log, *quat_log, *omega_log, *acc_log, *payload_pos,
-                    swing_angle_x, swing_angle_y, swing_rate_x, swing_rate_y,
-                    *thrust_actual, *wrench,
+                                        
+                    *pos_log, *vel_log, *quat_log,
+                    
+                    *omega_log, *acc_log,
+                    
+                    *payload_pos, swing_angle_x, swing_angle_y, swing_rate_x, swing_rate_y,
+
+                    # Existing values
+                    *thrust_actual,
+                    
+                    # Desired attitude (NEW)
+                    desired_roll,
+                    desired_pitch,
+                    desired_yaw,
+
+                    # Existing desired wrench
+                    *wrench,
+
+                    # Esc commands
+                    *motor_command,
+
+                    # Actual motor angular velocity
+                    *actuator_output.omega,
+
+                    # Actual motor reaction torque
+                    *torque_actual,
+
+                    # Actual total thrust
+                    actual_total_thrust,
+
+                    # Thrust_tracking_error
+                    thrust_tracking_error,
+
+                    # Saturation count
+                    motor_saturation_count,
                 ]
                 writer.writerow(row)
                 # last_log_time = float(data.time)

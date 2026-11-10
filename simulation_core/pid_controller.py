@@ -207,6 +207,11 @@ class CascadePID:
     def reset(self) -> None:
         self._i_vel = np.zeros(3)
         self._i_rate = np.zeros(3)
+        
+        # Desired attitude logging
+        self.desired_roll = 0.0
+        self.desired_pitch = 0.0
+        self.desired_yaw = 0.0
 
     def __call__(
         self,
@@ -270,6 +275,11 @@ class CascadePID:
         desired_rotation = np.column_stack(
             [body_x_desired, body_y_desired, body_z_desired]
         )
+        
+        # Extract desired Euler angles from desired rotation matrix
+        self.desired_roll = np.arctan2(desired_rotation[2, 1], desired_rotation[2, 2])
+        self.desired_pitch = np.arcsin(np.clip(-desired_rotation[2, 0], -1.0, 1.0))
+        self.desired_yaw = np.arctan2(desired_rotation[1, 0], desired_rotation[0, 0])
 
         attitude_matrix = (
             desired_rotation.T @ rotation - rotation.T @ desired_rotation

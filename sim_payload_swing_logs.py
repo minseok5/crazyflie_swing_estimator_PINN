@@ -58,6 +58,10 @@ from config.actuator_config import (
     THRUST_POLYNOMIAL,
     ENABLE_REACTION_TORQUE,
     REACTION_TORQUE_MODEL,
+    TORQUE_POLYNOMIAL,
+    TORQUE_POLYNOMIAL_SCALE,
+    ROTOR_INERTIA,
+    ENABLE_ROTOR_ACCELERATION_TORQUE,
 )
 
 # Simulation configuration
@@ -108,9 +112,9 @@ def get_circular_target(elapsed_time):
         omega = 2.0 *np.pi /CIRCLE_PERIOD
         theta = omega * elapsed_time
 
-        x_des = CIRCLE_CENTER_X - CIRCLE_RADIUS * np.cos(3 * theta)
-        y_des = CIRCLE_CENTER_Y + CIRCLE_RADIUS * np.sin(0.1 * theta)
-        z_des = 1.5 + np.sin(theta / 5)
+        x_des = CIRCLE_CENTER_X - CIRCLE_RADIUS * np.cos(theta)
+        y_des = CIRCLE_CENTER_Y + CIRCLE_RADIUS * np.sin(theta)
+        z_des = 1.5 # + np.sin(theta / 5)
 
         return np.array([x_des, y_des, z_des])
 
@@ -259,6 +263,10 @@ def main():
             steady_state_gain_rad_s=OMEGA_REFERENCE,
             thrust_polynomial_coefficients=THRUST_POLYNOMIAL,
             reaction_torque_model=REACTION_TORQUE_MODEL,
+            torque_polynomial_coefficients=TORQUE_POLYNOMIAL,
+            torque_polynomial_scale=TORQUE_POLYNOMIAL_SCALE,
+            rotor_inertia_kg_m2=ROTOR_INERTIA,
+            include_rotor_acceleration_torque=ENABLE_ROTOR_ACCELERATION_TORQUE,
         )
         print("Actuator: First-order motor dynamics enabled")
 
@@ -318,10 +326,32 @@ def main():
         "payload_x_m", "payload_y_m", "payload_z_m",
         "swing_angle_x_rad", "swing_angle_y_rad",
         "swing_rate_x_radps", "swing_rate_y_radps",
-        "motor0_thrust_N", "motor1_thrust_N",
-        "motor2_thrust_N", "motor3_thrust_N",
-        "torque_x_Nm", "torque_y_Nm",
-        "torque_z_Nm", "collective_force_N"
+
+        "motor0_thrust_N", "motor1_thrust_N", "motor2_thrust_N", "motor3_thrust_N",
+
+        # Desired attitude
+        "desired_roll_rad", "desired_pitch_rad", "desired_yaw_rad",
+
+        # Desired wrench
+        "torque_x_Nm", "torque_y_Nm", "torque_z_Nm", "collective_force_N",
+
+        # Esc commands
+        "motor0_esc", "motor1_esc", "motor2_esc", "motor3_esc",
+
+        # Actual motor angular velocity
+        "motor0_omega_radps", "motor1_omega_radps", "motor2_omega_radps", "motor3_omega_radps",
+
+        # Applied motor reaction torque
+        "motor0_torque_Nm", "motor1_torque_Nm", "motor2_torque_Nm", "motor3_torque_Nm",
+
+        # Actual total thrust
+        "actual_total_thrust_N",
+
+        # Actual tracking error
+        "thrust_tracking_error_N",
+
+        # Number of saturatied motors
+        "motor_saturation_count"
     ])
 
     print(f'Model: {MODEL_PATH}; payload mass={PAYLOAD_MASS:.3f} kg; duration={SIM_DURATION}s')
@@ -387,6 +417,11 @@ def main():
                 yaw_des=YAW_DES,
             )
 
+            # Desired attitude
+            desired_roll = pid.desired_roll
+            desired_pitch = pid.desired_pitch
+            desired_yaw = pid.desired_yaw
+
             # Control allocation: requested motor thrust
             thrust_cmd = np.clip(
                 allocation_pinv @ wrench,
@@ -400,6 +435,9 @@ def main():
             # Actual motor thrust and reaction torque
             thrust_actual = actuator_output.f_actual
             torque_actual = actuator_output.q_actual
+
+            # ESC command (normalized 0~1)
+            motor_command = actuator_output.motor_command
 
             if not ENABLE_REACTION_TORQUE:
                 torque_actual = np.zeros(4)
@@ -421,23 +459,66 @@ def main():
                 swing_rate_x = float(data.qvel[swing_x_vadr])
                 swing_rate_y = float(data.qvel[swing_y_vadr])
 
+                # Actual total thrust
+                actual_total_thrust = float(np.sum(thrust_actual))
+
+                # Desired collective force from PID
+                desired_collective_force = float(wrench[3])
+
+                # Thrust tracking erre
+                thrust_tracking_error = (actual_total_thrust - desired_collective_force)
+
+                # Count saturation motors
+                motor_saturation_error = int(np.sum((thrust_cmd <= THRUST_MIN + 1e-6) | (thrust_cmd >= THRUST_MAX - 1e+6)))
+
                 csv_writer.writerow([
                     data.time,
                     int(move_started),
                     *pos_des,
+
+                    # Drone state
                     *data.qpos[qa:qa+3],
                     *data.qvel[va:va+3],
                     *data.qpos[qa+3:qa+7],
+
                     # Gyroscope
                     *omega,
                     # Accelerometer
                     *acc,
+
                     # Payload state
                     *payload_pos,
                     swing_angle_x, swing_angle_y,
                     swing_rate_x, swing_rate_y,
+
+                    # Existing actual motor thrust
                     *thrust_actual,
-                    *wrench
+
+                    # Desired attitude (NEW)
+                    desired_roll,
+                    desired_pitch,
+                    desired_yaw,
+
+                    # Exusting desired wrench
+                    *wrench,
+
+                    # Esc commands
+                    *motor_command,
+
+                    # Actual motor angular velocity
+                    *actuator_output.omega,
+
+                    # Applied motor reaction torque
+                    *torque_actual,
+    
+                    # Actual total thrust
+                    actual_total_thrust,
+
+                    # Thrust tracking error
+                    thrust_tracking_error,
+
+                    # Motor saturation count
+                    motor_saturation_error,
                 ])
 
                 main._last_log_time = data.time

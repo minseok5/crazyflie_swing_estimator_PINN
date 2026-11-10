@@ -26,12 +26,12 @@ METRICS_DIR = RESULTS_DIR/"metrics"
 CHECKPOINT_DIR = Path("outputs/training/checkpoints")
 
 SEED = 42
-BATCH_SIZE = 128
+BATCH_SIZE = 256
 MAX_EPOCHS = 100
 LEARNING_RATE = 1e-3
 PATIENCE = 15
 
-INPUT_SIZE = 6
+INPUT_SIZE = 14
 HIDDEN_SIZE = 256
 OUTPUT_SIZE = 4
 
@@ -88,7 +88,7 @@ class SwingLSTM(nn.Module):
         # Use the final output of the input window.
         last_output = sequence_output[:, -1, :]
 
-        # Predict the two swing angles at the target time.
+        # Predict the swing angles and angular velocities at the target time.
         return self.mlp(last_output)
 
 
@@ -130,7 +130,7 @@ def to_loader(X, y, shuffle):
     )
 
 
-train_loader = to_loader(X_train, y_train, shuffle=True)
+train_loader = to_loader(X_train, y_train, shuffle=False)
 val_loader = to_loader(X_val, y_val, shuffle=False)
 test_loader = to_loader(X_test, y_test, shuffle=False)
 
@@ -238,6 +238,10 @@ for epoch in range(1, MAX_EPOCHS + 1):
                     "gyro_x_radps",
                     "gyro_y_radps",
                     "gyro_z_radps",
+                    "motor0_omega_radps",
+                    "motor1_omega_radps",
+                    "motor2_omega_radps",
+                    "motor3_omega_radps",
                 ],
                 "labels": [
                     "swing_angle_x_rad",
@@ -270,7 +274,7 @@ plt.figure(figsize=(9, 5))
 plt.plot(train_losses, label="Training MSE")
 plt.plot(val_losses, label="Validation MSE")
 plt.xlabel("Epoch")
-plt.ylabel("MSE (rad^2)")
+plt.ylabel("Normalized MSE")
 plt.title("LSTM Training History")
 plt.legend()
 plt.grid(True, alpha=0.3)
@@ -329,7 +333,7 @@ print(f"X-axis angle RMSE: {rmse[0]:.6f} rad ({np.degrees(rmse[0]):.3f} deg)")
 print(f"Y-axis angle RMSE: {rmse[1]:.6f} rad ({np.degrees(rmse[1]):.3f} deg)")
 
 print(f"X-axis angular velocity MAE: {mae[2]:.6f} rad/s")
-print(f"Y-axis angular velocity MAE: {mae[3]:.6f} rsd/s")
+print(f"Y-axis angular velocity MAE: {mae[3]:.6f} rad/s")
 print(f"X-axis angular velocity RMSE: {rmse[2]:.6f} rad/s")
 print(f"Y-axis angular velocity RMSE: {rmse[3]:.6f} rad/s")
 

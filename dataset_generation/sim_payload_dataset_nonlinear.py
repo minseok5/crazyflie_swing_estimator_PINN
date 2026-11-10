@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""Run one headless Crazyflie + slung-payload episode and save CSV logs.
+
+Run from the repository root:
+    python -m dataset_generation.sim_payload_dataset --duration 10
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from datetime import datetime
+
+import mujoco
+import numpy as np
+
+from simulation_core.pid_controller import (
+    CascadePID, K_TAU, MOTOR_DIR, THRUST_MIN, THRUST_MAX,
+)
+
+from simulation_core.dynamic_nonlinear_allocator import DynamicNonlinearAllocator
+
+from simulation_core.motor_dynamics import (
+    Cf21bFirstOrderActuatorModel,
+    InstantaneousActuatorModel,
+)
+
+from config.vehicle_config import ARM_LENGTH
+
+from config.actuator_config import (
+    ENABLE_MOTOR_DYNAMICS,
+    MOTOR_TIME_CONSTANT,
+    OMEGA_REFERENCE,
+    THRUST_POLYNOMIAL,
+    ENABLE_REACTION_TORQUE,
+    REACTION_TORQUE_MODEL,
+    TORQUE_POLYNOMIAL,
+    TORQUE_POLYNOMIAL_SCALE,
+    ROTOR_INERTIA,
+    ENABLE_ROTOR_ACCELERATION_TORQUE,
+)
+
+from . import dataset_config as cfg
+
+
+def ensure_model() -> None:
+    """Create the payload XML once if the repository's generator is available."""
+    if cfg.MODEL_PATH.exists():
+        return
+    if not cfg.MODEL_GENERATOR.exists():
+        raise FileNotFoundError(
+            f"Model not found: {cfg.MODEL_PATH}. "
+            f"Generator not found: {cfg.MODEL_GENERATOR}"
+        )
+    subprocess.run([sys.executable, str(cfg.MODEL_GENERATOR)],
+                   cwd=cfg.PROJECT_ROOT, check=True)
+    if not cfg.MODEL_PATH.exists():
+        raise FileNotFoundError(f"Generator did not create {cfg.MODEL_PATH}")
+
+
+def object_id(model, obj_type, name: str) -> int:
+    idx = mujoco.mj_name2id(model, obj_type, name)
+    if idx < 0:
+        raise ValueError(f"MuJoCo object not found: {name}")
+    return int(idx)
+
+
+def get_target(trajectory: str, elapsed: float, speed_scale: float) -> np.ndarray:
+    """Desired position. Circle preserves the current viewer's target equation."""
+    z = float(cfg.HOVER_POSITION[2])
+    if trajectory == "circle":
+        omega = 2.0 * math.pi / cfg.CIRCLE_PERIOD * speed_scale
+        theta = omega * elapsed
+        # Preserve the original simulation's existing trajectory equation.
+        x = cfg.CIRCLE_CENTER_X - cfg.CIRCLE_RADIUS * math.cos(theta)
+        y = cfg.CIRCLE_CENTER_Y + cfg.CIRCLE_RADIUS * math.sin(theta)
+    elif trajectory == "figure8":
+        omega = 2.0 * math.pi / cfg.FIGURE8_PERIOD * speed_scale
+        theta = omega * elapsed
+        x = cfg.FIGURE8_AMPLITUDE_X * math.sin(theta)
+        y = cfg.FIGURE8_AMPLITUDE_Y * math.sin(theta) * math.cos(theta)
+    elif trajectory == "straight":
+        # Smooth out-and-back path, bounded to STRAIGHT_DISTANCE.
+        period = max(math.pi * cfg.STRAIGHT_DISTANCE / (cfg.STRAIGHT_SPEED * speed_scale), 1e-6)
+        phase = 2.0 * math.pi * elapsed / period
+        x = 0.5 * cfg.STRAIGHT_DISTANCE * (1.0 - math.sin(phase))
+        y = cfg.CIRCLE_CENTER_Y
+    else:
+        raise ValueError(f"Unsupported trajectory {trajectory!r}; choose {cfg.TRAJECTORIES}")
+    return np.array([x, y, z], dtype=float)
+
+
+CSV_COLUMNS = [
+    "episode_id", "time_s", "trajectory_started",
+    "target_x_m", "target_y_m", "target_z_m",
+    "drone_x_m", "drone_y_m", "drone_z_m",
+    "drone_vx_mps", "drone_vy_mps", "drone_vz_mps",
+    "quat_w", "quat_x", "quat_y", "quat_z",
+    "gyro_x_radps", "gyro_y_radps", "gyro_z_radps",
+    "acc_x_mps2", "acc_y_mps2", "acc_z_mps2",
+    "payload_x_m", "payload_y_m", "payload_z_m",
+    "swing_angle_x_rad", "swing_angle_y_rad",
+    "swing_rate_x_radps", "swing_rate_y_radps",
+
+    # Existing motor thrust
+    "motor0_thrust_N", "motor1_thrust_N", "motor2_thrust_N", "motor3_thrust_N",
+
+    # Desired attitude
+    "Desired_roll_rad",
+    "Desired_pitch_rad",
+    "Desired_yaw_rad",
+
+    # Existing desired wrench
+    "torque_x_Nm", "torque_y_Nm", "torque_z_Nm", "collective_force_N",
+
+    # Esc commands
+    "motor0_esc", "motor1_esc", "motor2_esc", "motor3_esc",
+
+    # Actual motor angular velocity
+    "motor0_omega_radps", "motor1_omega_radps", "motor2_omega_radps", "motor3_omega_radps",
+
+    # Actual motor reaction torque
+    "motor0_torque_Nm", "motor1_torque_Nm", "motor2_torque_Nm", "motor3_torque_Nm",
+
+    # Actual collective thrust
+    "actual_total_thrust_N",
+
+    # Tracking error
+    "thrust_tracking_error_N",
+
+    # Motor saturation
+    "motor_saturation_count",
+]
+
+
+def run_episode(
+    episode_id: int = 1,
+    output_dir: str | Path | None = None,
+    duration: float = cfg.DEFAULT_DURATION,
+    trajectory: str = cfg.DEFAULT_TRAJECTORY,
+    initial_swing_x_rad: float = 0.0,
+    initial_swing_y_rad: float = 0.0,
+    speed_scale: float = cfg.DEFAULT_SPEED_SCALE,
+    seed: int = 0,
+    realtime: bool = False,
+) -> dict:
+    """Run a fresh, independent episode and return its metadata."""
+    if duration <= 0:
+        raise ValueError("duration must be > 0")
+    if speed_scale <= 0:
+        raise ValueError("speed_scale must be > 0")
+    if trajectory not in cfg.TRAJECTORIES:
+        raise ValueError(f"trajectory must be one of {cfg.TRAJECTORIES}")
+
+    ensure_model()
+    model = mujoco.MjModel.from_xml_path(str(cfg.MODEL_PATH))
+    data = mujoco.MjData(model)
+    model.opt.timestep = cfg.DT
+
+    payload_id = object_id(model, mujoco.mjtObj.mjOBJ_BODY, "payload_body")
+    free_id = next(
+        (i for i in range(model.njnt)
+         if model.jnt_type[i] == mujoco.mjtJoint.mjJNT_FREE),
+        None,
+    )
+    if free_id is None:
+        raise RuntimeError("No free joint found in the model.")
+    qa = int(model.jnt_qposadr[free_id])
+    va = int(model.jnt_dofadr[free_id])
+    data.qpos[qa:qa + 3] = np.asarray(cfg.INITIAL_DRONE_POSITION, dtype=float)
+    data.qpos[qa + 3:qa + 7] = [1.0, 0.0, 0.0, 0.0]
+    data.qvel[va:va + 6] = 0.0
+
+    swing_x_id = object_id(model, mujoco.mjtObj.mjOBJ_JOINT, "swing_joint_x")
+    swing_y_id = object_id(model, mujoco.mjtObj.mjOBJ_JOINT, "swing_joint_y")
+    swing_x_qadr = int(model.jnt_qposadr[swing_x_id])
+    swing_y_qadr = int(model.jnt_qposadr[swing_y_id])
+    swing_x_vadr = int(model.jnt_dofadr[swing_x_id])
+    swing_y_vadr = int(model.jnt_dofadr[swing_y_id])
+    data.qpos[swing_x_qadr] = float(initial_swing_x_rad)
+    data.qpos[swing_y_qadr] = float(initial_swing_y_rad)
+    mujoco.mj_forward(model, data)
+
+    vehicle = SimpleNamespace(
+    mass=cfg.DRONE_MASS + cfg.PAYLOAD_MASS,
+    gravity=cfg.GRAVITY,
+    inertia_diagonal=cfg.DRONE_INERTIA,
+    )
+
+    pid = CascadePID(dt=cfg.DT, vehicle=vehicle)
+    allocator = DynamicNonlinearAllocator(
+        arm_length=ARM_LENGTH, motor_direction=MOTOR_DIR, prediction_horizon_steps=25,
+    )
+
+    actuator_common = {
+        "motor_direction": MOTOR_DIR,
+        "thrust_min": THRUST_MIN,
+        "thrust_max": THRUST_MAX,
+        "legacy_ratio_m": K_TAU,
+    }
+
+    if ENABLE_MOTOR_DYNAMICS:
+        actuator = Cf21bFirstOrderActuatorModel(
+            dt=cfg.DT,
+            **actuator_common,
+            time_constant_s=MOTOR_TIME_CONSTANT,
+            steady_state_gain_rad_s=OMEGA_REFERENCE,
+            thrust_polynomial_coefficients=THRUST_POLYNOMIAL,
+            reaction_torque_model=REACTION_TORQUE_MODEL,
+            torque_polynomial_coefficients=TORQUE_POLYNOMIAL,
+            torque_polynomial_scale=TORQUE_POLYNOMIAL_SCALE,
+            rotor_inertia_kg_m2=ROTOR_INERTIA,
+            include_rotor_acceleration_torque=ENABLE_ROTOR_ACCELERATION_TORQUE,
+        )
+        print("Actuator: First-order motor dynamics enabled")
+    else:
+        actuator = InstantaneousActuatorModel(**actuator_common)
+        print("Actuator: Instantaneous model enabled")
+
+    actuator.reset(airborne=False)
+    if not ENABLE_MOTOR_DYNAMICS:
+        raise RuntimeError(
+            "DynamicNonlinearAllocator requires ENABLE_MOTOR_DYNAMICS=True"
+        )
+    allocator.reset()
+
+
+    force_ids = np.array([
+        object_id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"motor{i}_force")
+        for i in range(4)
+    ])
+    torque_ids = np.array([
+        object_id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"motor{i}_torque")
+        for i in range(4)
+    ])
+
+    gyro_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, "imu_gyro")
+    gyro_adr = int(model.sensor_adr[gyro_id]) if gyro_id >= 0 else None
+    gyro_dim = int(model.sensor_dim[gyro_id]) if gyro_id >= 0 else 3
+    acc_id = object_id(model, mujoco.mjtObj.mjOBJ_SENSOR, "imu_acc")
+    acc_adr = int(model.sensor_adr[acc_id])
+    acc_dim = int(model.sensor_dim[acc_id])
+
+    out_dir = Path(output_dir) if output_dir is not None else cfg.OUTPUT_DIR
+    if not out_dir.is_absolute():
+        out_dir = cfg.PROJECT_ROOT / out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    csv_path = out_dir / f"episode_{episode_id:06d}_{stamp}.csv"
+
+    stable_start_time = None
+    move_started = False
+    move_start_time = None
+    # last_log_time = -cfg.LOG_INTERVAL
+    log_every_n_steps = round(cfg.LOG_INTERVAL / cfg.DT)
+    status = "completed"
+    n_steps = int(math.ceil(duration / cfg.DT))
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(CSV_COLUMNS)
+        for step in range(n_steps):
+            pos = data.qpos[qa:qa + 3].copy()
+            quat = data.qpos[qa + 3:qa + 7].copy()
+            vel = data.qvel[va:va + 3].copy()
+            if gyro_adr is not None:
+                omega = data.sensordata[gyro_adr:gyro_adr + gyro_dim].copy()
+            else:
+                omega = data.qvel[va + 3:va + 6].copy()
+            acc = data.sensordata[acc_adr:acc_adr + acc_dim].copy()
+
+            if not np.all(np.isfinite(np.concatenate([pos, quat, vel, omega, acc]))):
+                status = "nonfinite_state"
+                break
+
+            if not move_started:
+                altitude_error = abs(float(cfg.HOVER_POSITION[2]) - pos[2])
+                vertical_speed = abs(vel[2])
+                if altitude_error < cfg.ALTITUDE_TOL and vertical_speed < cfg.VERTICAL_VEL_TOL:
+                    if stable_start_time is None:
+                        stable_start_time = float(data.time)
+                    elif data.time - stable_start_time >= cfg.STABLE_DURATION:
+                        move_started = True
+                        move_start_time = float(data.time)
+                else:
+                    stable_start_time = None
+
+            if move_started:
+                target = get_target(trajectory, data.time - move_start_time, speed_scale)
+            else:
+                target = np.asarray(cfg.HOVER_POSITION, dtype=float)
+
+            wrench = pid(
+                pos_W=pos, quat_wxyz=quat, vel_W=vel, omega_B=omega,
+                pos_des=target, yaw_des=cfg.YAW_DES,
+            )
+
+            # Desired attitude
+            desired_roll = pid.desired_roll
+            desired_pitch = pid.desired_pitch
+            desired_yaw = pid.desired_yaw
+
+            # Predict next-step motor speed, thrust and reaction torque.
+            motor_command = allocator.allocate(wrench, actuator)
+            actuator_output = actuator.apply_motor_command(motor_command)
+
+            thrust_actual = actuator_output.f_actual
+            torque_actual = actuator_output.q_actual
+
+            if not ENABLE_REACTION_TORQUE:
+                torque_actual = np.zeros(4)
+
+            data.ctrl[force_ids] = thrust_actual
+            data.ctrl[torque_ids] = torque_actual
+
+            mujoco.mj_step(model, data)
+
+            if (step +1) % log_every_n_steps == 0:
+                # Read all states after mj_step at the same simulation step.
+                pos_log = data.qpos[qa:qa + 3].copy()
+                quat_log = data.qpos[qa + 3:qa + 7].copy()
+                vel_log = data.qvel[va:va + 3].copy()
+
+                if gyro_adr is not None:
+                    omega_log = data.sensordata[gyro_adr:gyro_adr + gyro_dim].copy()
+                else:
+                    omega_log = data.qvel[va + 3:va + 6].copy()
+
+                acc_log = data.sensordata[acc_adr:acc_adr + acc_dim].copy()
+
+                payload_pos = data.xpos[payload_id].copy()
+
+                swing_angle_x = float(data.qpos[swing_x_qadr])
+                swing_angle_y = float(data.qpos[swing_y_qadr])
+                swing_rate_x = float(data.qvel[swing_x_vadr])
+                swing_rate_y = float(data.qvel[swing_y_vadr])
+
+                # Actual total thrust
+                actual_total_thrust = float(np.sum(thrust_actual))
+
+                # Desired collective force from PID
+                desired_collective_force = float(wrench[3])
+
+                # Thrust tracking error
+                thrust_tracking_error = (actual_total_thrust - desired_collective_force)
+
+                # Number of saturated motors
+                motor_saturation_count = int(np.sum((motor_command <= 0.001) | (motor_command >= 0.999)))
+                
+                row = [
+                    episode_id, float(data.time), int(move_started), *target,
+                    
+                    *pos_log, *vel_log, *quat_log, *omega_log, *acc_log, *payload_pos,
+
+                    swing_angle_x, swing_angle_y, swing_rate_x, swing_rate_y,
+
+                    # Existing thrust
+                    *thrust_actual,
+
+                    # Desired attitude
+                    desired_roll,
+                    desired_pitch,
+                    desired_yaw,
+                    
+                    # Existing desired wrench
+                    *wrench,
+
+                    # Esc commands
+                    *motor_command,
+
+                    # Actual motor angular velocity
+                    *actuator_output.omega,
+
+                    # Actual motor reaction torque
+                    *actuator_output.q_actual,
+
+                    # Actual total thrust
+                    actual_total_thrust,
+
+                    # Thrust_tracking_error
+                    thrust_tracking_error,
+
+                    # Saturation count
+                    motor_saturation_count,
+                ]
+                
+                writer.writerow(row)
+                # last_log_time = float(data.time)
+
+            if pos[2] < -0.1:
+                status = "possible_crash"
+                break
+            if realtime:
+                import time
+                time.sleep(cfg.DT)
+
+    return {
+        "episode_id": episode_id,
+        "csv_path": str(csv_path),
+        "status": status,
+        "trajectory": trajectory,
+        "duration_s": duration,
+        "initial_swing_x_rad": initial_swing_x_rad,
+        "initial_swing_y_rad": initial_swing_y_rad,
+        "speed_scale": speed_scale,
+        "seed": seed,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--episode-id", type=int, default=1)
+    parser.add_argument("--duration", type=float, default=cfg.DEFAULT_DURATION)
+    parser.add_argument("--trajectory", choices=cfg.TRAJECTORIES, default=cfg.DEFAULT_TRAJECTORY)
+    parser.add_argument("--initial-swing-x-deg", type=float, default=0.0)
+    parser.add_argument("--initial-swing-y-deg", type=float, default=0.0)
+    parser.add_argument("--speed-scale", type=float, default=cfg.DEFAULT_SPEED_SCALE)
+    parser.add_argument("--output-dir", type=str, default=str(cfg.OUTPUT_DIR))
+    args = parser.parse_args()
+    result = run_episode(
+        episode_id=args.episode_id,
+        output_dir=args.output_dir,
+        duration=args.duration,
+        trajectory=args.trajectory,
+        initial_swing_x_rad=np.deg2rad(args.initial_swing_x_deg),
+        initial_swing_y_rad=np.deg2rad(args.initial_swing_y_deg),
+        speed_scale=args.speed_scale,
+    )
+    print(f"Episode {result['episode_id']}: {result['status']}")
+    print(f"CSV saved: {result['csv_path']}")
+
+
+if __name__ == "__main__":
+    main()

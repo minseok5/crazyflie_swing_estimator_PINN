@@ -31,7 +31,13 @@ THRUST_POLYNOMIAL = (
 
 # Reaction torque
 ENABLE_REACTION_TORQUE = True
-REACTION_TORQUE_MODEL = "legacy_ratio"
+REACTION_TORQUE_MODEL = "paper_polynomial"
+
+# Paper-based reaction torque model
+TORQUE_POLYNOMIAL = (-3.4, 8.7, 2.9)
+TORQUE_POLYNOMIAL_SCALE = 1e-4
+ROTOR_INERTIA = 0.5e-7  # kg m^2
+ENABLE_ROTOR_ACCELERATION_TORQUE = True
 
 # Motor randomization
 ENABLE_MOTOR_RANDOMIZATION = False
